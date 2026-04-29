@@ -8,6 +8,22 @@
 # Dataset descargado en runtime
 input.txt
 
+# Datos del corpus SBWC (10+ GB, no subir al repo)
+spanish_billion_words/
+data/
+checkpoints/
+*.bin
+*.pkl
+*.pt
+
+# Archivos comprimidos del dataset
+*.tar.bz2
+*.tar.gz
+*.zip
+
+# Backups locales
+*.old
+
 # Python
 __pycache__/
 *.pyc

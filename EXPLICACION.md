@@ -17,6 +17,7 @@
 9. [Inferencia: cómo genera texto nuevo](#9-inferencia-cómo-genera-texto-nuevo)
 10. [Glosario rápido](#10-glosario-rápido)
 11. [¿Cuántos parámetros tiene el modelo? La fórmula](#11-cuántos-parámetros-tiene-el-modelo-la-fórmula)
+12. [Del prototipo al modelo real: `nanogpt_es.py`](#12-del-prototipo-al-modelo-real-nanogpt_espy)
 
 ---
 
@@ -550,3 +551,157 @@ donde `N` = nº de parámetros y `D` = nº de tokens de entrenamiento. Con esto 
 | Hardware | tu portátil | una GPU | miles de GPUs | decenas de miles |
 
 **Pero el código es esencialmente el mismo**. Por eso este archivo es tan valioso: si entiendes `microgpt.py`, entiendes la base de cualquier LLM moderno.
+
+---
+
+## 12. Del prototipo al modelo real: `nanogpt_es.py`
+
+`microgpt.py` es perfecto para entender los conceptos, pero su Python puro no aguanta texto en cantidades reales. El archivo **`nanogpt_es.py`** que acompaña a este repositorio es la versión "industrial" del mismo algoritmo, ya entrenable sobre el [Spanish Billion Words Corpus](http://cs.famaf.unc.edu.ar/~ccardellino/SBWCE/) (~10 GB de castellano limpio).
+
+El **algoritmo es idéntico**. Lo que cambia son las técnicas de implementación que aparecen en cualquier LLM moderno. Esta sección explica esas técnicas nuevas.
+
+### 12.1 Tensores en lugar de escalares
+
+En `microgpt.py` cada operación se hace con un solo número (`Value`). En `nanogpt_es.py` (PyTorch) se hace con **tensores**: matrices N-dimensionales que se procesan en paralelo en GPU.
+
+```
+   microgpt:    a × b              (1 multiplicación)
+   nanogpt:     [B, T, C] @ [C, D] (B·T·C·D multiplicaciones a la vez)
+```
+
+Una GPU moderna puede hacer billones de estas operaciones por segundo. La aceleración típica vs CPU es de 10–100×.
+
+### 12.2 Mixed precision: bfloat16 y float16
+
+Por defecto los tensores son `float32` (4 bytes/número). Pero los modelos modernos usan **half precision** (2 bytes) durante el forward/backward, manteniendo `float32` solo para el optimizador.
+
+| Tipo | Bytes | Rango | Cuándo usar |
+|---|---|---|---|
+| `float32` | 4 | ±3.4×10³⁸ | siempre seguro, el doble de memoria |
+| `float16` | 2 | ±6.5×10⁴ | rápido pero puede desbordar (necesita `GradScaler`) |
+| `bfloat16` | 2 | ±3.4×10³⁸ | rango como fp32, precisión menor — el favorito en GPUs Ampere+ |
+
+Beneficio: **2× memoria, 2-4× velocidad** sin pérdida apreciable de calidad.
+
+### 12.3 Flash Attention
+
+La atención manual de `microgpt.py` calcula la matriz `Q·Kᵀ` completa de tamaño `T × T`. Para `T = 2048` eso son 4 millones de números por cabeza por capa, multiplicados por el batch... explota la VRAM.
+
+**Flash Attention** (Tri Dao, 2022) calcula el mismo resultado matemático sin materializar nunca esa matriz, procesando bloques pequeños y fusionando operaciones en un único kernel GPU.
+
+```
+   Atención clásica:   O(T²) memoria
+   Flash Attention:    O(T)  memoria   (¡y además es más rápida!)
+```
+
+PyTorch 2.0 lo expone como `F.scaled_dot_product_attention(...)`. Es lo único que cambia visualmente, el resultado es idéntico.
+
+### 12.4 Weight tying
+
+Tanto el embedding de entrada (`wte`) como la cabeza de salida (`lm_head`) son matrices de tamaño `[vocab_size, n_embd]`. **Comparten los mismos pesos**:
+
+```python
+self.wte.weight = self.lm_head.weight
+```
+
+Justificación: ambas codifican la misma relación token ↔ vector. Compartirlos:
+- ahorra `vocab_size · n_embd` parámetros (mucho con vocabularios grandes)
+- regulariza el entrenamiento
+- mejora la perplejidad (Press & Wolf, 2017)
+
+### 12.5 Optimizador: de Adam a AdamW
+
+`microgpt.py` usa **Adam**. `nanogpt_es.py` usa **AdamW**, que separa la regularización L2 (*weight decay*) del gradiente.
+
+```
+   Adam:   actualiza pesos sin distinguir L2 (mezclada con momentum -> mal)
+   AdamW:  aplica L2 directamente sobre los pesos (correcto)
+```
+
+Además se aplica **solo a las matrices 2D** (los pesos importantes). Los biases y los parámetros de LayerNorm (1D) se dejan sin decay:
+
+| Tipo de parámetro | Weight decay |
+|---|---|
+| Matrices `Linear`, `Embedding` (2D) | 0.1 (fuerte) |
+| Biases, LayerNorm (1D) | 0 (ninguno) |
+
+### 12.6 Schedule del learning rate: warmup + cosine
+
+`microgpt.py` decae el LR linealmente. Los modelos serios usan un schedule en dos fases:
+
+```
+   lr ▲
+      │     ┌───────────╮
+      │    /             ╲
+      │   /               ╲___
+      │  /                    ╲___
+      │ /                         ╲_______
+      │/                                  └─────►
+      └─warmup─┤────────cosine decay──────────► iter
+```
+
+| Fase | Qué hace | Por qué |
+|---|---|---|
+| **Warmup** | LR sube linealmente de 0 al máximo (~100–2000 iter) | Evita explosiones al principio cuando los gradientes son ruidosos |
+| **Cosine decay** | LR baja suavemente hacia un mínimo (~10% del máximo) | Permite converger fino al final |
+
+Es el schedule de GPT-3, Llama, Chinchilla...
+
+### 12.7 Gradient accumulation: batches grandes con poca VRAM
+
+Los modelos rinden mejor con batches grandes (cientos o miles de secuencias). Pero en una sola GPU no caben tantas. Truco: **acumular gradientes** de varios micro-batches antes de hacer `optimizer.step()`.
+
+```
+   for accum_step in range(GRAD_ACCUM_STEPS):
+       loss = forward(micro_batch) / GRAD_ACCUM_STEPS
+       loss.backward()           # acumula gradientes
+   optimizer.step()              # actualiza UNA vez con la suma de todos
+```
+
+Resultado: efectivamente entrenas con `batch_size · grad_accum_steps`, gastando memoria solo de `batch_size`.
+
+### 12.8 Gradient clipping
+
+Si en una iteración cualquiera los gradientes son enormes (un valor extremo en los datos, una inicialización mala...), el optimizador puede dar un paso descomunal y romper el modelo.
+
+**Gradient clipping**: limitamos la *norma* total de los gradientes a un máximo (típicamente 1.0):
+
+```
+   if ||grad|| > 1.0:
+       grad = grad * (1.0 / ||grad||)   # reescalamos al máximo permitido
+```
+
+Es como un cinturón de seguridad: en el 99% de los casos no hace nada, pero el 1% que sí actúa salva el entrenamiento.
+
+### 12.9 Top-k sampling: cortar la cola larga
+
+En `microgpt.py` muestreamos directamente de la distribución completa. Problema: incluso tras dividir por la temperatura, los miles de tokens "improbables" suman una probabilidad no trivial → de vez en cuando se cuela una elección absurda.
+
+**Top-k sampling**: antes del softmax, ponemos a `-∞` todos los logits que no estén en el top-k:
+
+```
+   logits originales:   [3.2, 2.8, 1.5, 0.4, -0.1, ...]   (vocab_size logits)
+   top_k = 3:           [3.2, 2.8, 1.5, -∞,  -∞,  ...]
+   softmax:             [0.50, 0.34, 0.16, 0, 0, ...]   (suman 1)
+```
+
+Resultado: el modelo solo puede elegir entre los `k` candidatos más razonables. Una variante más sofisticada es **top-p / nucleus sampling** (mantiene los más probables hasta acumular probabilidad `p`), usada por GPT-4, Claude, etc.
+
+### 12.10 Tabla resumen: qué añade `nanogpt_es.py`
+
+| Concepto | `microgpt.py` | `nanogpt_es.py` |
+|---|---|---|
+| Operaciones | escalares | tensores |
+| Hardware | CPU 1 hilo | CPU / GPU / Apple Silicon |
+| Precisión | float64 (Python) | float32 / bfloat16 / float16 |
+| Atención | manual | Flash Attention |
+| Embeddings de entrada/salida | independientes | weight tying |
+| Optimizador | Adam | AdamW (con grupos) |
+| Schedule LR | decay lineal | warmup + cosine |
+| Tamaño de batch | 1 documento | grad accumulation |
+| Estabilidad | — | gradient clipping |
+| Sampling | softmax + temp | softmax + temp + top-k |
+| Datos en memoria | todo cargado | `np.memmap` |
+| Validación | — | val loss + checkpoint del mejor |
+
+Ninguno de estos cambia la **idea** de un LLM. Son optimizaciones de ingeniería que permiten entrenar modelos grandes en datos grandes en hardware real.
