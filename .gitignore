@@ -1,0 +1,16 @@
+# IDE / editor
+.idea/
+.vscode/
+
+# Claude Code local
+.claude/
+
+# Dataset descargado en runtime
+input.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
